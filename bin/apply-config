@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""
+bin/apply-config
+Reads deps.yaml and writes values into service .dev.env files.
+Safe to re-run — existing keys are updated in-place; missing keys are appended.
+
+Usage:
+    make apply-config        # via Makefile target
+    bin/apply-config         # direct
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("Error: PyYAML not installed. Run: pip install pyyaml")
+
+REPO = Path(__file__).resolve().parent.parent
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def log_section(name: str) -> None:
+    print(f"\n── {name} " + "─" * max(0, 44 - len(name)))
+
+def get(obj, *keys, default=None):
+    """Navigate a nested dict safely; return default when any key is absent."""
+    for k in keys:
+        if not isinstance(obj, dict) or k not in obj:
+            return default
+        obj = obj[k]
+    return obj
+
+def configured(value) -> bool:
+    return value is not None and str(value).strip() != ""
+
+def set_env(rel_path: str, key: str, value) -> None:
+    """
+    Write KEY=value into a service env file.
+    - If the key already exists: replaces the line in-place.
+    - If the key is absent: appends it.
+    - Skips silently when value is None/empty or the file doesn't exist.
+    """
+    if value is None or str(value).strip() == "":
+        return
+    path = REPO / rel_path
+    if not path.exists():
+        return
+    val_str = str(value).lower() if isinstance(value, bool) else str(value)
+    content = path.read_text()
+    pattern = re.compile(rf'^{re.escape(key)}=.*', re.MULTILINE)
+    if pattern.search(content):
+        content = pattern.sub(f"{key}={val_str}", content)
+    else:
+        content = content.rstrip("\n") + f"\n{key}={val_str}\n"
+    path.write_text(content)
+    display = val_str if len(val_str) <= 32 else val_str[:29] + "..."
+    print(f"    {rel_path}  →  {key}={display}")
+
+def apply_flag_to_all_dev_envs(key: str, value) -> None:
+    """
+    Apply KEY=value to every .dev.env / dev.env in the repo that already declares
+    that key. Used for global flags like INSTRUMENTATION_ENABLED.
+    """
+    if value is None:
+        return
+    for path in sorted(REPO.rglob("*.env")):
+        rel = str(path.relative_to(REPO))
+        if any(skip in rel for skip in ("vendor", ".test.env", ".local.env")):
+            continue
+        if not (rel.endswith(".dev.env") or rel.endswith("dev.env")):
+            continue
+        try:
+            content = path.read_text()
+        except OSError:
+            continue
+        if re.search(rf"^{key}=", content, re.MULTILINE):
+            set_env(rel, key, value)
+
+# ── service env file paths ────────────────────────────────────────────────────
+
+LITELLM       = "core-services/deps-litellm/etc/litellm/.dev.env"
+OCR_GW        = "core-services/deps-ocr-gateway/etc/deps-ocr-api-gateway/env/dev.env"
+PARSING       = "core-services/deps-parsing/etc/parsing/env/.dev.env"
+AI_FUSION     = "feature-services/deps-ai-fusion/etc/ai-fusion/env/.dev.env"
+META_AGENT    = "feature-services/deps-meta-agent/etc/meta-agent/env/.dev.env"
+FILE_STORAGE  = "core-services/deps-file-storage/etc/deps-file-storage/env/.dev.env"
+CNE           = "feature-services/deps-cloud-native-extraction/etc/cloud-native-extraction/env/.dev.env"
+OUTPUT_EXPORTING = "feature-services/deps-output-exporting/etc/output-exporting/env/.dev.env"
+IMAGE_PREPROCESS = "feature-services/deps-image-preprocess/etc/deps-image-preprocess/env/.dev.env"
+IAM           = "core-services/deps-iam/etc/api/env/.dev.env"
+FRONTEND      = "core-services/deps-frontend/.env"
+NGINX         = "core-services/deps-nginx/.env"
+
+STORAGE_FILES = [
+    FILE_STORAGE,
+    PARSING,
+    "feature-services/deps-classification/etc/classification/env/.dev.env",
+    "feature-services/deps-file/etc/file/env/.dev.env",
+]
+
+# Defaults written to deps-frontend/.env on every apply-config run.
+# Values come from the QA reference environment; override via deps.yaml frontend section.
+FRONTEND_DEFAULTS = {
+    "WTF_CSRF_ENABLED":                               "true",
+    "FALLBACK_LANG":                                  "en-US",
+    "AUTH_TYPE":                                      "oidc",
+    "REQUEST_TIMEOUT":                                "2400000",
+    "MAX_FILE_SIZE_MB":                               "100",
+    "MAX_PROTOTYPE_REFERENCE_LAYOUT_SIZE_MB":         "100",
+    "SUPPORT_EMAIL":                                  "SupportDEPS@support.com",
+    "FEATURE_OIDC_LOG_LEVEL":                         "0",
+    # Feature flags
+    "FEATURE_AI_PROMPTED_EXTRACTORS":                 "true",
+    "FEATURE_TRIAL_VERSION":                          "false",
+    "FEATURE_AZURE_CLOUD_NATIVE_EXTRACTOR":           "true",
+    "FEATURE_DOCUMENT_DELETE":                        "true",
+    "FEATURE_SEQUENTIAL_PROTOTYPE_REQUESTS":          "true",
+    "FEATURE_PROMPT_CALIBRATION_STUDIO_TEMPERATURE":  "0",
+    "FEATURE_PROMPT_CALIBRATION_STUDIO_TOP_P":        "1",
+    "FEATURE_PROMPT_CALIBRATION_STUDIO_GROUPING_FACTOR": "5",
+    "FEATURE_PROMPT_CALIBRATION_STUDIO_LOGPROBS":     "false",
+    "FEATURE_CLASSIFIER":                             "true",
+    "FEATURE_LLM_DATA_EXTRACTION":                    "true",
+    "FEATURE_PAGINATED_TABLES":                       "true",
+    "FEATURE_OCR_INTERSECTION_ALGORITHM_THRESHOLD":   "0.5",
+    "FEATURE_DASHBOARD":                              "true",
+    "FEATURE_SERVER_SENT_EVENTS":                     "true",
+    "FEATURE_DOCUMENT_TYPES_GROUPS":                  "true",
+    "FEATURE_HIDDEN_ENGINES":                         "false",
+    "FEATURE_COPY_INVITE":                            "true",
+    "FEATURE_FILE_CACHE":                             "true",
+    "FEATURE_MACHINE_LEARNING_MODELS":                "true",
+    "FEATURE_HIDE_LEGACY":                            "true",
+    "FEATURE_SCALE_TO_POINT":                         "false",
+    "FEATURE_VALIDATION_BUSINESS_RULES":              "true",
+    "FEATURE_FILES":                                  "true",
+    "FEATURE_DOCUMENT_UPLOAD":                        "true",
+    "FEATURE_BULK_RETRY_PREVIOUS_STEP":               "false",
+    "FEATURE_RUN_PIPELINE":                           "true",
+    "FEATURE_LABELING_TOOL":                          "true",
+    "FEATURE_OCR_INTERSECTION_ALGORITHM":             "true",
+    "FEATURE_HIDE_LOW_CONFIDENCE_DUE_TO_VALIDATION_ERRORS": "false",
+    "FEATURE_GEN_AI_CHAT":                            "true",
+    "FEATURE_DOCUMENT_LAYOUT":                        "true",
+    "FEATURE_MARKDOWN_LAYOUT":                        "false",
+    "FEATURE_CONFIGURABLE_CONFIDENCE_LEVEL":          "true",
+    "FEATURE_UI_SETTINGS":                            "true",
+    "FEATURE_AGENTIC_DOCUMENT_PROCESSING":            "false",
+    "FEATURE_DOCUMENT_LAYOUT_EDITING":                "true",
+    "FEATURE_GEN_AI_KEY_VALUE_FIELDS":                "false",
+    "FEATURE_AUTO_LABELING":                          "false",
+    "FEATURE_DOCUMENT_TYPE_IMPORT_EXPORT":            "false",
+    "FEATURE_ASSIGN_DOCUMENT_TYPE_TO_FILE":           "true",
+    "FEATURE_PROTOTYPE_REFERENCE_LAYOUT":             "true",
+    "FEATURE_RETRY_PREVIOUS_STEP":                    "true",
+    "FEATURE_TABLE_DETECTION":                        "true",
+    "FEATURE_COLLAPSIBLE_SELECTED_CELLS":             "false",
+    "FEATURE_MANAGE_TEMPLATE_VERSIONS":               "true",
+    "FEATURE_SHOW_NOT_APPLICABLE_CONFIDENCE":         "false",
+    "FEATURE_DATA_EXTRACTION":                        "true",
+    "FEATURE_DOCUMENT_CHANGE_TYPE":                   "true",
+    "FEATURE_PROMPT_CALIBRATION_STUDIO":              "true",
+    "FEATURE_SERVICE_AVAILABILITY_CHECK":             "false",
+    "FEATURE_FILE_LAYOUT_EDITING":                    "false",
+    "FEATURE_PER_FIELD_VALIDATION":                   "false",
+    "FEATURE_FILES_BATCH":                            "true",
+    "FEATURE_CONFIDENCE_LEVEL_VIEW":                  "asNumbers",
+    "FEATURE_FIELDS_DISPLAY_MODE":                    "true",
+    "FEATURE_LIST_EDITING_MODE":                      "true",
+    "FEATURE_OUTPUT_PROFILES":                        "true",
+    "FEATURE_CONSOLIDATED_DOCUMENT_TYPE_FIELDS":      "true",
+    "FEATURE_PROTOTYPES":                             "true",
+    "FEATURE_FILL_CANVAS_POLYGONS":                   "false",
+    "FEATURE_TEMPLATES":                              "true",
+    "FEATURE_PDF_VIEWER":                             "true",
+    "FEATURE_HIDDEN_LLM_PROVIDERS":                   "false",
+    "FEATURE_OMR_AREA":                               "true",
+    "FEATURE_PDF_SPLITTING":                          "false",
+    "FEATURE_ENTITIES_UPLOAD":                        "false",
+    "FEATURE_MULTIFILE_SESSION_UPLOAD":               "false",
+    "FEATURE_USER_MANAGEMENT":                        "true",
+    "FEATURE_ENRICHMENT":                             "true",
+    "FEATURE_LLM_EXTRACTORS":                         "true",
+    "FEATURE_INVITE_BY_MAIL":                         "true",
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    config_path = REPO / "deps.yaml"
+    if not config_path.exists():
+        sys.exit(
+            f"\nError: {config_path} not found.\n"
+            "Create it first:\n"
+            "  make setup-credentials    (interactive wizard)\n"
+            "  cp deps.yaml.example deps.yaml  (then edit manually)\n"
+        )
+
+    cfg = yaml.safe_load(config_path.read_text()) or {}
+    print(f"Applying {config_path.name} …")
+
+    # ── LiteLLM ───────────────────────────────────────────────────────────────
+    log_section("LiteLLM")
+    lm = get(cfg, "litellm") or {}
+    master_key = get(lm, "master_key")
+    set_env(LITELLM,    "LITELLM_MASTER_KEY", master_key)
+    set_env(LITELLM,    "LITELLM_SALT_KEY",   get(lm, "salt_key"))
+    # Sync the proxy key into services that connect to it
+    set_env(AI_FUSION,  "LITELLM_API_KEY", master_key)
+    set_env(META_AGENT, "LITELLM_API_KEY", master_key)
+
+    # ── OCR ───────────────────────────────────────────────────────────────────
+    log_section("OCR")
+    ocr = get(cfg, "ocr") or {}
+
+    # Tesseract is always on — built-in, no credentials required.
+    set_env(OCR_GW, "TESSERACT_ENABLED", True)
+
+    afr = get(ocr, "azure_form_recognizer") or {}
+    set_env(OCR_GW,  "AZURE_FORM_RECOGNIZER_ENABLED",  get(afr, "enabled"))
+    set_env(OCR_GW,  "AZURE_FORM_RECOGNIZER_API_URL",  get(afr, "api_url"))
+    set_env(OCR_GW,  "AZURE_FORM_RECOGNIZER_API_KEY",  get(afr, "api_key"))
+    set_env(PARSING, "AZURE_FORM_RECOGNIZER_API_URL",  get(afr, "api_url"))
+    set_env(PARSING, "AZURE_FORM_RECOGNIZER_API_KEY",  get(afr, "api_key"))
+    set_env(PARSING, "AZURE_PARSING_STRATEGY",         get(afr, "parsing_strategy"))
+
+    textract = get(ocr, "aws_textract") or {}
+    set_env(OCR_GW,  "AWS_TEXTRACT_ENABLED",          get(textract, "enabled"))
+    set_env(OCR_GW,  "AWS_REGION_NAME",               get(textract, "region"))
+    set_env(OCR_GW,  "AWS_ACCESS_KEY_ID",             get(textract, "access_key_id"))
+    set_env(OCR_GW,  "AWS_SECRET_ACCESS_KEY",         get(textract, "secret_access_key"))
+    set_env(PARSING, "AWS_TEXTRACT_REGION_NAME",      get(textract, "region"))
+    set_env(PARSING, "AWS_TEXTRACT_ACCESS_KEY_ID",    get(textract, "access_key_id"))
+    set_env(PARSING, "AWS_TEXTRACT_SECRET_ACCESS_KEY", get(textract, "secret_access_key"))
+    set_env(PARSING, "AWS_TEXTRACT_PARSING_STRATEGY", get(textract, "parsing_strategy"))
+    # deps-parsing uploads documents to S3 so AWS Textract can read them.
+    # These are independent of storage.aws (file-storage can still be local MinIO).
+    set_env(PARSING, "AWS_ACCESS_KEY_ID",             get(textract, "access_key_id"))
+    set_env(PARSING, "AWS_SECRET_ACCESS_KEY",         get(textract, "secret_access_key"))
+    set_env(PARSING, "AWS_REGION",                    get(textract, "region"))
+    set_env(PARSING, "S3_BUCKET_NAME",                get(textract, "s3_bucket_name"))
+    set_env(PARSING, "S3_ENDPOINT_URL",               get(textract, "s3_endpoint_url"))
+    if get(textract, "enabled"):
+        set_env(PARSING, "AWS_EC2_METADATA_DISABLED", True)
+
+    gcp_vision = get(ocr, "gcp_vision") or {}
+    set_env(OCR_GW, "GCP_VISION_ENABLED",  get(gcp_vision, "enabled"))
+    set_env(OCR_GW, "GCP_VISION_AUTH_KEY", get(gcp_vision, "auth_key"))
+
+    # ── Parsing ───────────────────────────────────────────────────────────────
+    log_section("Parsing")
+    parsing_cfg = get(cfg, "parsing") or {}
+    set_env(PARSING, "IMG_ANNOTATION_LLM", get(parsing_cfg, "img_annotation_llm"))
+
+    gcp_docai = get(parsing_cfg, "gcp_docai") or {}
+    set_env(PARSING, "GCP_DOCAI_ACCOUNT_INFO_JSON",             get(gcp_docai, "account_info_json"))
+    set_env(PARSING, "GCP_DOCAI_PROJECT_ID",                    get(gcp_docai, "project_id"))
+    set_env(PARSING, "GCP_DOCAI_LOCATION",                      get(gcp_docai, "location"))
+    set_env(PARSING, "GCP_DOCAI_FORM_RECOGNITION_PROCESSOR_ID", get(gcp_docai, "processor_id"))
+
+    cne = get(parsing_cfg, "cloud_native_extraction") or {}
+    set_env(CNE, "AZURE_VAULT_URL",     get(cne, "azure_vault_url"))
+    set_env(CNE, "AZURE_CLIENT_ID",     get(cne, "client_id"))
+    set_env(CNE, "AZURE_TENANT_ID",     get(cne, "tenant_id"))
+    set_env(CNE, "AZURE_CLIENT_SECRET", get(cne, "client_secret"))
+
+    # ── LLM providers ─────────────────────────────────────────────────────────
+    log_section("LLM providers")
+    llm = get(cfg, "llm") or {}
+
+    dial = get(llm, "epam_dial") or {}
+    set_env(LITELLM,    "DIAL_API_BASE",          get(dial, "api_base"))
+    set_env(LITELLM,    "DIAL_API_KEY",           get(dial, "api_key"))
+    set_env(LITELLM,    "DIAL_API_VERSION",       get(dial, "api_version"))
+    set_env(AI_FUSION,  "EPAM_DIAL_ENDPOINT",     get(dial, "api_base"))
+    set_env(AI_FUSION,  "EPAM_DIAL_API_KEY",      get(dial, "api_key"))
+    set_env(AI_FUSION,  "EPAM_DIAL_API_VERSION",  get(dial, "api_version"))
+    set_env(META_AGENT, "EPAM_DIAL_ENDPOINT",     get(dial, "api_base"))
+    set_env(META_AGENT, "EPAM_DIAL_API_KEY",      get(dial, "api_key"))
+    set_env(META_AGENT, "EPAM_DIAL_API_VERSION",  get(dial, "api_version"))
+
+    azure_oai = get(llm, "azure_openai") or {}
+    set_env(LITELLM,    "AZURE_API_BASE",       get(azure_oai, "api_endpoint"))
+    set_env(LITELLM,    "AZURE_API_KEY",        get(azure_oai, "api_key"))
+    set_env(AI_FUSION,  "AZURE_API_ENDPOINT",   get(azure_oai, "api_endpoint"))
+    set_env(AI_FUSION,  "AZURE_API_KEY",        get(azure_oai, "api_key"))
+    set_env(AI_FUSION,  "AZURE_API_VERSION",    get(azure_oai, "api_version"))
+    set_env(META_AGENT, "AZURE_API_ENDPOINT",   get(azure_oai, "api_endpoint"))
+    set_env(META_AGENT, "AZURE_API_KEY",        get(azure_oai, "api_key"))
+    set_env(META_AGENT, "AZURE_API_VERSION",    get(azure_oai, "api_version"))
+
+    openai = get(llm, "openai") or {}
+    set_env(AI_FUSION,  "OPENAI_API_KEY", get(openai, "api_key"))
+    set_env(META_AGENT, "OPENAI_API_KEY", get(openai, "api_key"))
+
+    bedrock = get(llm, "aws_bedrock") or {}
+    set_env(LITELLM,    "AWS_REGION_NAME",                 get(bedrock, "region"))
+    set_env(LITELLM,    "AWS_ACCESS_KEY_ID",               get(bedrock, "access_key_id"))
+    set_env(LITELLM,    "AWS_SECRET_ACCESS_KEY",           get(bedrock, "secret_access_key"))
+    set_env(AI_FUSION,  "AWS_BEDROCK_REGION",              get(bedrock, "region"))
+    set_env(AI_FUSION,  "AWS_BEDROCK_ACCESS_KEY_ID",       get(bedrock, "access_key_id"))
+    set_env(AI_FUSION,  "AWS_BEDROCK_SECRET_ACCESS_KEY",   get(bedrock, "secret_access_key"))
+    set_env(META_AGENT, "AWS_REGION",                      get(bedrock, "region"))
+    set_env(META_AGENT, "AWS_ACCESS_KEY_ID",               get(bedrock, "access_key_id"))
+    set_env(META_AGENT, "AWS_SECRET_ACCESS_KEY",           get(bedrock, "secret_access_key"))
+
+    gemini = get(llm, "google_gemini") or {}
+    set_env(LITELLM,    "GOOGLE_API_KEY", get(gemini, "api_key"))
+    set_env(AI_FUSION,  "GOOGLE_API_KEY", get(gemini, "api_key"))
+    set_env(META_AGENT, "GOOGLE_API_KEY", get(gemini, "api_key"))
+
+    deepseek = get(llm, "deepseek") or {}
+    set_env(LITELLM, "DEEPSEEK_API_KEY", get(deepseek, "api_key"))
+
+    groq = get(llm, "groq") or {}
+    set_env(LITELLM, "GROQ_API_KEY", get(groq, "api_key"))
+
+    providers: list[str] = []
+    if configured(get(dial, "api_key")):
+        providers.append("dial")
+    if configured(get(azure_oai, "api_key")):
+        providers.append("azure")
+    if configured(get(bedrock, "access_key_id")) and configured(get(bedrock, "secret_access_key")):
+        providers.append("aws-bedrock")
+    if configured(get(gemini, "api_key")):
+        providers.append("google")
+    set_env(AI_FUSION, "SUPPORTED_PROVIDERS", f"'{json.dumps(providers)}'")
+
+    # ── Object storage ────────────────────────────────────────────────────────
+    log_section("Object storage")
+    storage = get(cfg, "storage") or {}
+
+    azure_blob = get(storage, "azure") or {}
+    for f in STORAGE_FILES:
+        set_env(f, "AZURE_CONNECTION_STRING", get(azure_blob, "connection_string"))
+        set_env(f, "AZURE_CONTAINER_NAME",    get(azure_blob, "container_name"))
+
+    aws_s3 = get(storage, "aws") or {}
+    for f in STORAGE_FILES:
+        if f == PARSING and get(textract, "s3_bucket_name"):
+            # Textract S3 already written onto deps-parsing; do not overwrite with storage.aws.
+            continue
+        set_env(f, "AWS_ACCESS_KEY_ID",     get(aws_s3, "access_key_id"))
+        set_env(f, "AWS_SECRET_ACCESS_KEY", get(aws_s3, "secret_access_key"))
+        set_env(f, "AWS_REGION",            get(aws_s3, "region"))
+        set_env(f, "S3_ENDPOINT_URL",       get(aws_s3, "endpoint_url"))
+        set_env(f, "S3_BUCKET_NAME",        get(aws_s3, "bucket_name"))
+
+    gcp_gcs = get(storage, "gcp") or {}
+    for f in STORAGE_FILES:
+        set_env(f, "GCP_BLOB_STORAGE_AUTH_KEY",    get(gcp_gcs, "auth_key"))
+        set_env(f, "GCP_BLOB_STORAGE_BUCKET_NAME", get(gcp_gcs, "bucket_name"))
+
+    # ── SMTP ──────────────────────────────────────────────────────────────────
+    log_section("SMTP")
+    smtp = get(cfg, "smtp") or {}
+    set_env(IAM, "SMTP_HOST",     get(smtp, "host"))
+    set_env(IAM, "SMTP_PORT",     get(smtp, "port"))
+    set_env(IAM, "SMTP_LOGIN",    get(smtp, "login"))
+    set_env(IAM, "SMTP_PASSWORD", get(smtp, "password"))
+
+    # ── Frontend ──────────────────────────────────────────────────────────────
+    log_section("Frontend")
+    fe = get(cfg, "frontend") or {}
+    base_url = (get(fe, "base_url") or "http://localhost:8000").rstrip("/")
+
+    # Step 1: apply defaults (FEATURE_* flags, AUTH_TYPE, misc)
+    for key, value in FRONTEND_DEFAULTS.items():
+        set_env(FRONTEND, key, value)
+
+    # Step 2: generate service URLs from base_url
+    FRONTEND_URLS = {
+        "BASE_API_URL":          "/api",
+        "BACKEND_URL":           "/api/document",
+        "TABLES_URL":            "/api/tables",
+        "OCR_URL":               "/api/ocr",
+        "PREPROCESS_URL":        "/api/preprocess",
+        "IAM_URL":               "/api/iam",
+        "FILE_STORAGE_URL":      "/api/storage",
+        "OMR_URL":               "/api/omr",
+        "TEMPLATE_URL":          "/api/template",
+        "WORKFLOW_MANAGER_URL":  "/api/workflow-manager",
+        "API_GATEWAY_URL":       "/api/deps",
+        "OUTPUT_EXPORTING_URL":  "/api/output-exporting",
+        "IMAGE_PREPROCESS_URL":  "/api/image-preprocess",
+        "DOCUMENT_TYPE_URL":     "/api/document-type",
+        "EXTRACTION_URL":        "/api/extraction",
+        "UNIFIER_URL":           "/api/unifier",
+        "RESULT_EXPORTING_URL":  "/api/result-exporting",
+        "PROTOTYPE_URL":         "/api/prototype",
+        "NER_URL":               "/api/ner",
+        "PROMPTER_URL":          "/api/prompter",
+        "AGENTIC_AI_URL":        "/api/agentic-ai",
+        "COMPARISON_URL":        "/api/comparison",
+        "MFE_COMPARISON_URL":    "/api/comparison",
+    }
+    for env_var, path_suffix in FRONTEND_URLS.items():
+        set_env(FRONTEND, env_var, base_url + path_suffix)
+
+    # Step 3: apply user credentials / overrides from deps.yaml
+    gdrive = get(fe, "google_drive") or {}
+    set_env(FRONTEND, "GOOGLE_DRIVE_API_KEY",               get(gdrive, "api_key"))
+    set_env(FRONTEND, "GOOGLE_DRIVE_CLIENT_ID",             get(gdrive, "client_id"))
+    set_env(FRONTEND, "GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL", get(gdrive, "service_account_email"))
+    onedrive = get(fe, "one_drive") or {}
+    set_env(FRONTEND, "ONE_DRIVE_CLIENT_ID",             get(onedrive, "client_id"))
+    set_env(FRONTEND, "ONE_DRIVE_SERVICE_ACCOUNT_EMAIL", get(onedrive, "service_account_email"))
+
+    # Step 4: OIDC auth settings (only active when feature_flags.auth_enabled: true)
+    auth_fe = get(cfg, "auth") or {}
+    set_env(FRONTEND, "AUTH_BASE_URL",  get(auth_fe, "base_url"))
+    set_env(FRONTEND, "AUTH_REALM",     get(auth_fe, "realm"))
+    set_env(FRONTEND, "AUTH_CLIENT_ID", get(auth_fe, "client_id"))
+    set_env(FRONTEND, "AUTH_SCOPE",     get(auth_fe, "scope"))
+
+    # Step 5: Elastic APM
+    apm = get(cfg, "elastic_apm") or {}
+    set_env(FRONTEND, "ELASTIC_SERVER_URL",   get(apm, "server_url"))
+    set_env(FRONTEND, "ELASTIC_ENVIRONMENT",  get(apm, "environment"))
+    set_env(FRONTEND, "ELASTIC_SERVICE_NAME", get(apm, "service_name"))
+    set_env(FRONTEND, "ELASTIC_PROJECT_CODE", get(apm, "project_code"))
+
+    # ── Auth (nginx) ──────────────────────────────────────────────────────────
+    log_section("Auth")
+    auth = get(cfg, "auth") or {}
+    set_env(NGINX, "UPSTREAM_AUTH_URL", get(auth, "upstream_auth_url"))
+    set_env(NGINX, "AUTH_URI",          get(auth, "auth_uri"))
+
+    # ── Feature flags ─────────────────────────────────────────────────────────
+    log_section("Feature flags")
+    flags = get(cfg, "feature_flags") or {}
+
+    # auth_enabled → deps-iam only
+    set_env(IAM, "AUTH_ENABLED", get(flags, "auth_enabled"))
+
+    # deps-image-preprocess requires auth on for local / open-source
+    set_env(IMAGE_PREPROCESS, "AUTH_ENABLED", True)
+
+    # auth_verify_ssl → all services that declare it (controls SSL for auth token calls)
+    val = get(flags, "auth_verify_ssl")
+    if val is not None:
+        apply_flag_to_all_dev_envs("AUTH_VERIFY_SSL", val)
+
+    # instrumentation_enabled → all services that declare it
+    val = get(flags, "instrumentation_enabled")
+    if val is not None:
+        apply_flag_to_all_dev_envs("INSTRUMENTATION_ENABLED", val)
+
+    # Parsing-specific flags
+    set_env(PARSING, "SEMANTIC_LAYOUT_ENABLED", get(flags, "semantic_layout_enabled"))
+    set_env(PARSING, "MERGE_TABLES_ENABLED",    get(flags, "merge_tables_enabled"))
+
+    # LiteLLM proxy routing in ai-fusion
+    set_env(AI_FUSION, "LITELLM_ENABLED", get(flags, "litellm_enabled"))
+
+    # Output-exporting validation pipeline (defaults on for local / open-source)
+    new_validation = get(flags, "new_validation_process")
+    set_env(OUTPUT_EXPORTING, "NEW_VALIDATION_PROCESS", True if new_validation is None else new_validation)
+
+    # Frontend GenAI key-value fields tab — override FRONTEND_DEFAULTS when set in deps.yaml
+    gen_ai_kv = get(flags, "gen_ai_key_value_fields")
+    if gen_ai_kv is not None:
+        set_env(FRONTEND, "FEATURE_GEN_AI_KEY_VALUE_FIELDS", gen_ai_kv)
+
+    print("\n✓ Done.")
+
+if __name__ == "__main__":
+    main()

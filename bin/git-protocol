@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Choose HTTPS or SSH for GitHub clones in this clone only.
+#
+# Top-level .gitmodules uses HTTPS; nested vendor .gitmodules still use SSH.
+# The choice is stored with `git config --local` (not ~/.gitconfig). URL
+# rewriting is applied via GIT_CONFIG_* so nested `git submodule` processes
+# inherit it.
+#
+# Usage:
+#   bin/git-protocol prompt          # ask if unset, then save
+#   eval "$(bin/git-protocol env)"   # prompt if needed; export rewrite vars
+#   bin/git-protocol run <cmd>...    # prompt if needed, then exec cmd
+#
+# Override without a prompt: DEPS_GIT_PROTOCOL=https|ssh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONFIG_KEY="deps.gitProtocol"
+
+usage() {
+	cat <<'EOF'
+Usage: bin/git-protocol <prompt|env|run> [command...]
+
+  prompt   Ask HTTPS vs SSH if this clone has no saved choice, then save it
+  env      Print export statements for eval (prompts if needed)
+  run cmd  Apply the rewrite and exec cmd
+
+Set DEPS_GIT_PROTOCOL=https|ssh to skip the prompt.
+EOF
+}
+
+normalize() {
+	case "${1,,}" in
+	https | http) printf '%s' https ;;
+	ssh) printf '%s' ssh ;;
+	*) return 1 ;;
+	esac
+}
+
+saved_protocol() {
+	git -C "$ROOT" config --local --get "$CONFIG_KEY" 2>/dev/null || true
+}
+
+save_protocol() {
+	git -C "$ROOT" config --local "$CONFIG_KEY" "$1"
+}
+
+prompt_protocol() {
+	echo >&2
+	echo "How should Git clone GitHub submodules?" >&2
+	echo "  Saved in this clone only — not in your global git config." >&2
+	echo >&2
+	echo "  1) HTTPS  — no SSH key; public repos clone anonymously" >&2
+	echo "  2) SSH    — requires a GitHub SSH key" >&2
+	echo >&2
+	while true; do
+		printf 'Choice [1/2] (default: 1): ' >&2
+		read -r n || true
+		case "${n:-1}" in
+		1 | https | HTTPS | http)
+			printf '%s' https
+			return
+			;;
+		2 | ssh | SSH)
+			printf '%s' ssh
+			return
+			;;
+		*)
+			echo "Please enter 1 or 2." >&2
+			;;
+		esac
+	done
+}
+
+resolve_protocol() {
+	local proto=""
+	local source=""
+
+	if [[ -n "${DEPS_GIT_PROTOCOL:-}" ]]; then
+		if ! proto="$(normalize "$DEPS_GIT_PROTOCOL")"; then
+			echo "DEPS_GIT_PROTOCOL must be 'https' or 'ssh' (got: ${DEPS_GIT_PROTOCOL})" >&2
+			exit 1
+		fi
+		source=env
+	else
+		proto="$(saved_protocol)"
+		if [[ -n "$proto" ]]; then
+			if ! proto="$(normalize "$proto")"; then
+				echo "Invalid ${CONFIG_KEY} in git config: $(saved_protocol)" >&2
+				exit 1
+			fi
+			source=saved
+		elif [[ -t 0 ]]; then
+			proto="$(prompt_protocol)"
+			source=prompt
+		else
+			echo "No Git protocol chosen. Re-run in a terminal, or set DEPS_GIT_PROTOCOL=https|ssh" >&2
+			exit 1
+		fi
+	fi
+
+	save_protocol "$proto"
+	if [[ "$source" != saved ]]; then
+		echo "Using ${proto} for GitHub clones (this clone). Override with DEPS_GIT_PROTOCOL=https|ssh." >&2
+	fi
+	printf '%s' "$proto"
+}
+
+emit_env() {
+	local proto="$1"
+	local count="${GIT_CONFIG_COUNT:-0}"
+	printf 'export DEPS_GIT_PROTOCOL=%q\n' "$proto"
+	printf 'export GIT_CONFIG_COUNT=%q\n' "$((count + 1))"
+	if [[ "$proto" == https ]]; then
+		printf 'export GIT_CONFIG_KEY_%s=%q\n' "$count" 'url.https://github.com/.insteadOf'
+		printf 'export GIT_CONFIG_VALUE_%s=%q\n' "$count" 'git@github.com:'
+	else
+		printf 'export GIT_CONFIG_KEY_%s=%q\n' "$count" 'url.git@github.com:.insteadOf'
+		printf 'export GIT_CONFIG_VALUE_%s=%q\n' "$count" 'https://github.com/'
+	fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+prompt)
+	resolve_protocol >/dev/null
+	;;
+env)
+	emit_env "$(resolve_protocol)"
+	;;
+run)
+	shift
+	if [[ $# -eq 0 ]]; then
+		echo "git-protocol run: missing command" >&2
+		exit 1
+	fi
+	eval "$(emit_env "$(resolve_protocol)")"
+	exec "$@"
+	;;
+-h | --help | help)
+	usage
+	;;
+"")
+	usage >&2
+	exit 1
+	;;
+*)
+	echo "Unknown command: $cmd" >&2
+	usage >&2
+	exit 1
+	;;
+esac

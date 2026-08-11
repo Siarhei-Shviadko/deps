@@ -1,0 +1,6 @@
+# Local credentials — never commit
+deps.yaml
+
+# Local env overrides
+.env
+.env.nginx

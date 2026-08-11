@@ -1,0 +1,204 @@
+# DEPS Platform Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# First-time setup:
+#   cp deps.yaml.example deps.yaml
+#   # fill in your credentials
+#   make apply-config
+#
+# Or let the interactive wizard generate it for you:
+#   make setup-credentials
+#
+# Re-apply at any time after editing:
+#   make apply-config
+#
+# deps.yaml is gitignored — never commit secrets.
+# deps.yaml.example is committed and documents every available setting.
+
+# ── LiteLLM proxy ─────────────────────────────────────────────────────────────
+# The LiteLLM proxy (deps-litellm) routes all LLM calls from the platform.
+# These two keys secure the proxy itself; change them before any public deployment.
+litellm:
+  master_key: "sk-change-me"       # must start with sk-
+  salt_key: "deps-salt-change-me"
+
+# ── OCR engines ───────────────────────────────────────────────────────────────
+# Tesseract is always enabled (built-in, no credentials). Extra engines are optional.
+# Credentials are applied to both deps-ocr-gateway and deps-parsing.
+ocr:
+  tesseract:
+    enabled: true                   # always on; built-in, no key needed
+
+  azure_form_recognizer:
+    enabled: false
+    api_url: ""                     # e.g. https://<name>.cognitiveservices.azure.com/
+    api_key: ""
+    parsing_strategy: by_document   # by_document | by_page
+
+  aws_textract:
+    enabled: false
+    region: eu-central-1
+    access_key_id: ""
+    secret_access_key: ""
+    parsing_strategy: by_document   # by_document | by_page
+    # deps-parsing uploads documents to S3 so AWS Textract can read them.
+    # Required when enabled. Use a real AWS bucket (not local MinIO).
+    # Access keys above are reused for S3.
+    s3_bucket_name: ""
+    s3_endpoint_url: ""             # e.g. https://s3.eu-central-1.amazonaws.com
+
+  gcp_vision:
+    enabled: false
+    auth_key: ""                    # service account JSON (single-line or path)
+
+# ── Document parsing ──────────────────────────────────────────────────────────
+parsing:
+  # LLM used to describe embedded images in documents.
+  # Format: <provider>@<model>   e.g. aws-bedrock@anthropic.claude-images
+  img_annotation_llm: "aws-bedrock@anthropic.claude-images"
+
+  # GCP Document AI (advanced structured parsing)
+  gcp_docai:
+    account_info_json: ""           # service account JSON
+    project_id: ""
+    location: "eu"
+    processor_id: ""
+
+  # Azure Cloud-Native Extraction (deps-cloud-native-extraction service)
+  cloud_native_extraction:
+    azure_vault_url: ""             # e.g. https://<name>.vault.azure.net/
+    client_id: ""
+    tenant_id: ""
+    client_secret: ""
+
+# ── LLM providers ─────────────────────────────────────────────────────────────
+# Keys are written to deps-litellm (proxy routing) and to deps-ai-fusion /
+# deps-meta-agent (direct-provider fallback).
+# You only need to fill in the providers you have access to.
+# deps-ai-fusion SUPPORTED_PROVIDERS is derived from whichever of
+# epam_dial / azure_openai / aws_bedrock / google_gemini have credentials.
+llm:
+  epam_dial:
+    api_base: "https://ai-proxy.lab.epam.com"
+    api_key: ""
+    api_version: "2023-12-01-preview"
+
+  azure_openai:
+    api_endpoint: ""                # e.g. https://<resource>.openai.azure.com/
+    api_key: ""
+    api_version: "2024-02-01"
+
+  openai:
+    api_key: ""
+
+  aws_bedrock:
+    region: us-east-1
+    access_key_id: ""
+    secret_access_key: ""
+
+  google_gemini:
+    api_key: ""
+
+  deepseek:
+    api_key: ""
+
+  groq:
+    api_key: ""
+
+# ── Object storage ────────────────────────────────────────────────────────────
+# Choose one backend. "local" uses the bundled MinIO (no credentials needed).
+# Applied to: deps-file-storage, deps-parsing, deps-classification, deps-file.
+storage:
+  backend: local                    # local | azure | aws | gcp
+
+  azure:
+    connection_string: ""           # DefaultEndpointsProtocol=https;...
+    container_name: ""
+
+  aws:
+    access_key_id: ""
+    secret_access_key: ""
+    region: eu-central-1
+    endpoint_url: ""                # leave empty for standard AWS S3
+    bucket_name: ""
+
+  gcp:
+    auth_key: ""                    # service account JSON
+    bucket_name: ""
+
+# ── SMTP ──────────────────────────────────────────────────────────────────────
+# Used by deps-iam to send user invitation emails.
+# Leave all fields empty to disable email sending.
+smtp:
+  host: ""
+  port: 587
+  login: ""
+  password: ""
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+# Required only when feature_flags.auth_enabled is true.
+auth:
+  # nginx subrequest — server-side token verification
+  upstream_auth_url: ""         # e.g. http://deps-iam-api:8080
+  auth_uri: ""                  # e.g. /api/iam/auth/token/verify
+
+  # OIDC — browser-side auth (deps-frontend)
+  base_url: ""                  # e.g. https://keycloak.example.com/auth
+  realm: ""                     # e.g. deps
+  client_id: ""                 # OIDC client ID registered in your provider
+  scope: "openid email profile"
+
+# ── Elastic APM ───────────────────────────────────────────────────────────────
+# Browser-side APM for deps-frontend. Leave all empty to disable.
+elastic_apm:
+  server_url: ""
+  environment: ""
+  service_name: "deps-frontend"
+  project_code: ""
+
+# ── Frontend ─────────────────────────────────────────────────────────────────
+# base_url is the public URL of the DEPS nginx gateway (port 8000 by default).
+# All service endpoint URLs sent to the browser are derived from it automatically.
+# FEATURE_* flag defaults and AUTH_TYPE are baked into bin/apply-config;
+# set individual keys here to override them.
+frontend:
+  base_url: "http://localhost:8000"
+
+  # Cloud file-picker integrations (optional)
+  google_drive:
+    api_key: ""
+    client_id: ""
+    service_account_email: ""
+
+  one_drive:
+    client_id: ""
+    service_account_email: ""
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+# Platform-wide behaviour toggles. The defaults below are tuned for
+# open-source / first-time use (auth off, telemetry off).
+feature_flags:
+  # Auth — set to true once you have an OIDC provider configured.
+  # Applies to deps-iam only.
+  auth_enabled: false
+
+  # SSL verification for auth token endpoint calls (disable for self-signed certs).
+  # Applies to all services that expose AUTH_VERIFY_SSL.
+  auth_verify_ssl: false
+
+  # Telemetry / OpenTelemetry export.
+  # Applies to all services that expose INSTRUMENTATION_ENABLED.
+  instrumentation_enabled: false
+
+  # Parsing features (deps-parsing)
+  semantic_layout_enabled: false     # AI-based layout detection
+  merge_tables_enabled: false        # merge split tables across pages
+
+  # Route LLM calls through the LiteLLM proxy (deps-ai-fusion).
+  # Set to false only if you want deps-ai-fusion to call a provider directly.
+  litellm_enabled: true
+
+  # deps-output-exporting — use the new validation pipeline.
+  new_validation_process: true
+
+  # deps-frontend — GenAI "key-value fields" tab. Off by default for open-source.
+  gen_ai_key_value_fields: false

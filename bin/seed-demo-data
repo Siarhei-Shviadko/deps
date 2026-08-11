@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""
+bin/seed-demo-data
+
+Seed demo document types (Template, Prototype, LLM Extractor) and upload sample
+documents through the public REST API (nginx gateway on port 8000).
+
+The Template document type always uses the built-in Tesseract engine. Prototype
+and LLM Extractor use a paid OCR engine (Azure Form Recognizer, AWS Textract, or
+GCP Vision) when one is configured in deps.yaml, falling back to Tesseract with a
+quality warning otherwise. If no usable LLM provider is configured/reachable, the
+LLM Extractor document type is skipped with a clear notice at the end of the run.
+
+Safe to re-run — existing document types are detected by name and skipped.
+
+Usage:
+    make seed-demo-data
+    bin/seed-demo-data
+    bin/seed-demo-data --base-url http://localhost:8000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("Error: PyYAML not installed. Run: pip install pyyaml")
+
+REPO = Path(__file__).resolve().parent.parent
+SAMPLES_DIR = REPO / "bin/document_examples"
+CONFIG_PATH = REPO / "deps.yaml"
+
+DEFAULT_ENGINE = "TESSERACT"
+DEFAULT_LANGUAGE = "eng"
+
+TEMPLATE_NAME = "Demo Invoice Template"
+PROTOTYPE_NAME = "Demo ID Card Prototype"
+LLM_NAME = "Demo Service Agreement LLM"
+LLM_EXTRACTOR_NAME = "Demo LLM Extractor"
+TEMPLATE_GROUP_NAME = "DEPS Demo Group"
+TEMPLATE_FIELDS = ("Invoice Number", "Total Due")
+TEMPLATE_VERSION_NAME = "Demo Invoice Layout"
+PROTOTYPE_FIELDS = (
+    ("Full Name", "Full Name:"),
+    ("Document ID", "Document ID:"),
+)
+LLM_QUERY_CODE = "agreementId"
+LLM_FIELD_NAME = "Agreement ID"
+
+# deps.yaml llm section key -> ai-fusion provider code
+LLM_PROVIDER_MAP: dict[str, str] = {
+    "epam_dial": "dial",
+    "azure_openai": "azure",
+    "openai": "openai",
+    "aws_bedrock": "aws-bedrock",
+    "google_gemini": "google",
+}
+
+# deps.yaml ocr section key -> (OCREngineEnum value, human-readable label).
+# Checked in this priority order; the first enabled + credentialed engine wins.
+OCR_PAID_ENGINES: tuple[tuple[str, str, str], ...] = (
+    ("azure_form_recognizer", "AZURE_FORM_RECOGNIZER", "Azure Form Recognizer"),
+    ("aws_textract", "AWS_TEXTRACT", "AWS Textract"),
+    ("gcp_vision", "GCP_VISION", "GCP Vision"),
+)
+
+WAIT_SECONDS = 60
+WAIT_INTERVAL = 3
+
+
+@dataclass
+class StepResult:
+    label: str
+    status: str  # created | skipped | failed
+    detail: str = ""
+
+
+@dataclass
+class SeedSummary:
+    base_url: str
+    results: list[StepResult] = field(default_factory=list)
+    ocr_fallback_used: bool = False
+
+    def add(self, label: str, status: str, detail: str = "") -> None:
+        self.results.append(StepResult(label=label, status=status, detail=detail))
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+
+def _encode_multipart(
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+) -> tuple[bytes, str]:
+    boundary = f"----deps-seed-{uuid.uuid4().hex}"
+    lines: list[bytes] = []
+
+    for name, value in fields.items():
+        lines.append(f"--{boundary}\r\n".encode())
+        lines.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        lines.append(f"{value}\r\n".encode())
+
+    for name, (filename, content, content_type) in files.items():
+        lines.append(f"--{boundary}\r\n".encode())
+        lines.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode()
+        )
+        lines.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+        lines.append(content)
+        lines.append(b"\r\n")
+
+    lines.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(lines)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+class ApiClient:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}{path}"
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[int, Any]:
+        data = None
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = Request(self._url(path), data=data, headers=headers, method=method)
+        try:
+            with urlopen(req, timeout=120) as resp:
+                raw = resp.read().decode("utf-8")
+                return resp.status, json.loads(raw) if raw else None
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {"message": exc.reason}
+            except json.JSONDecodeError:
+                payload = {"message": raw or exc.reason}
+            raise ApiError(exc.code, payload) from exc
+        except URLError as exc:
+            raise ApiError(0, {"message": str(exc.reason)}) from exc
+
+    def request_multipart(
+        self,
+        path: str,
+        fields: dict[str, str],
+        files: dict[str, tuple[str, bytes, str]],
+    ) -> tuple[int, Any]:
+        body, content_type = _encode_multipart(fields, files)
+        req = Request(
+            self._url(path),
+            data=body,
+            headers={"Accept": "application/json", "Content-Type": content_type},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=300) as resp:
+                raw = resp.read().decode("utf-8")
+                return resp.status, json.loads(raw) if raw else None
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {"message": exc.reason}
+            except json.JSONDecodeError:
+                payload = {"message": raw or exc.reason}
+            raise ApiError(exc.code, payload) from exc
+        except URLError as exc:
+            raise ApiError(0, {"message": str(exc.reason)}) from exc
+
+    def wait_until_ready(self) -> None:
+        deadline = time.time() + WAIT_SECONDS
+        path = "/api/v5/document-types"
+        while time.time() < deadline:
+            try:
+                self.request_json("GET", path)
+                return
+            except ApiError as exc:
+                if exc.status_code == 0:
+                    print(f"  Waiting for API at {self.base_url} … ({exc.message})")
+                else:
+                    print(f"  Waiting for API … (HTTP {exc.status_code})")
+            time.sleep(WAIT_INTERVAL)
+        raise SystemExit(
+            f"\nError: API at {self.base_url} did not become ready within {WAIT_SECONDS}s.\n"
+            "Ensure the stack is running: make run (or make start)."
+        )
+
+
+class ApiError(Exception):
+    def __init__(self, status_code: int, payload: Any) -> None:
+        self.status_code = status_code
+        self.payload = payload
+        self.message = _format_error(payload)
+
+    def __str__(self) -> str:
+        if self.status_code:
+            return f"HTTP {self.status_code}: {self.message}"
+        return self.message
+
+
+def _format_error(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("message", "detail", "error"):
+            if payload.get(key):
+                return str(payload[key])
+        return json.dumps(payload)[:500]
+    return str(payload)
+
+
+def log_section(name: str) -> None:
+    print(f"\n── {name} " + "─" * max(0, 44 - len(name)))
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    return yaml.safe_load(CONFIG_PATH.read_text()) or {}
+
+
+def resolve_base_url(cfg: dict[str, Any], cli_override: str | None) -> str:
+    if cli_override:
+        return cli_override.rstrip("/")
+    fe = cfg.get("frontend") or {}
+    return (fe.get("base_url") or "http://localhost:8000").rstrip("/")
+
+
+def llm_credentials_configured(cfg: dict[str, Any]) -> bool:
+    llm = cfg.get("llm") or {}
+    for section, provider_code in LLM_PROVIDER_MAP.items():
+        block = llm.get(section) or {}
+        if section == "aws_bedrock":
+            if block.get("access_key_id") and block.get("secret_access_key"):
+                return True
+        elif str(block.get("api_key", "")).strip():
+            return True
+    return False
+
+
+def configured_paid_ocr_engine(cfg: dict[str, Any]) -> tuple[str, str] | None:
+    """Return (engine_enum, label) for the first enabled + credentialed paid OCR engine."""
+    ocr = cfg.get("ocr") or {}
+    for section, engine_enum, label in OCR_PAID_ENGINES:
+        block = ocr.get(section) or {}
+        if not block.get("enabled"):
+            continue
+        if section == "aws_textract":
+            if block.get("access_key_id") and block.get("secret_access_key"):
+                return engine_enum, label
+        elif section == "gcp_vision":
+            if str(block.get("auth_key", "")).strip():
+                return engine_enum, label
+        else:  # azure_form_recognizer
+            if str(block.get("api_url", "")).strip() and str(block.get("api_key", "")).strip():
+                return engine_enum, label
+    return None
+
+
+def pick_ocr_engine(cfg: dict[str, Any], summary: SeedSummary) -> str:
+    """Choose the OCR engine for Prototype and LLM Extractor document types.
+
+    Prefers a configured paid engine (Azure Form Recognizer, AWS Textract, GCP Vision)
+    for better extraction quality; falls back to the built-in open-source Tesseract engine
+    with a visible warning. Template always uses Tesseract separately.
+    """
+    paid = configured_paid_ocr_engine(cfg)
+    if paid:
+        engine_enum, label = paid
+        print(f"  Prototype/LLM OCR engine: {label} ({engine_enum})")
+        return engine_enum
+
+    print("  No paid OCR engine configured in deps.yaml (azure_form_recognizer / aws_textract / gcp_vision).")
+    print("  Prototype/LLM will use open-source Tesseract — extraction quality will be noticeably lower.")
+    summary.ocr_fallback_used = True
+    return DEFAULT_ENGINE
+
+
+def configured_provider_codes(cfg: dict[str, Any]) -> set[str]:
+    llm = cfg.get("llm") or {}
+    codes: set[str] = set()
+    for section, provider_code in LLM_PROVIDER_MAP.items():
+        block = llm.get(section) or {}
+        if section == "aws_bedrock":
+            if block.get("access_key_id") and block.get("secret_access_key"):
+                codes.add(provider_code)
+        elif str(block.get("api_key", "")).strip():
+            codes.add(provider_code)
+    return codes
+
+
+def fetch_document_types(client: ApiClient) -> list[dict[str, Any]]:
+    _, payload = client.request_json("GET", "/api/v5/document-types")
+    return payload.get("result") or []
+
+
+def find_document_type_by_name(types: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for doc_type in types:
+        if doc_type.get("documentType") == name:
+            return doc_type
+    return None
+
+
+def read_sample(filename: str) -> tuple[bytes, str]:
+    path = SAMPLES_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Sample file missing: {path}\nRun: python3 demo-data/generate_samples.py")
+    content = path.read_bytes()
+    mime, _ = mimetypes.guess_type(str(path))
+    return content, mime or "application/octet-stream"
+
+
+def upload_document(
+    client: ApiClient,
+    *,
+    document_type_id: str,
+    document_name: str,
+    sample_file: str,
+    engine: str = DEFAULT_ENGINE,
+) -> str:
+    content, mime = read_sample(sample_file)
+    _, payload = client.request_multipart(
+        "/api/v6/documents",
+        fields={
+            "documentName": document_name,
+            "documentType": document_type_id,
+            "engine": engine,
+            "language": DEFAULT_LANGUAGE,
+        },
+        files={"file": (sample_file, content, mime)},
+    )
+    return str(payload.get("id", ""))
+
+
+def ensure_template_group(client: ApiClient) -> str:
+    """Return a template-service group id (template creation requires a group)."""
+    _, groups = client.request_json("GET", "/api/template/v1/groups")
+    if groups:
+        default = next((g for g in groups if g.get("isDefault")), None)
+        chosen = default or groups[0]
+        print(f"  Using template group: {chosen['name']} ({chosen['id']})")
+        return chosen["id"]
+
+    _, created = client.request_json(
+        "POST",
+        "/api/template/v1/groups",
+        {"name": TEMPLATE_GROUP_NAME},
+    )
+    group_id = created["groupId"]
+    print(f"  Created template group: {TEMPLATE_GROUP_NAME} ({group_id})")
+    return group_id
+
+
+def llm_extraction_query_payload() -> dict[str, Any]:
+    node_id = str(uuid.uuid4())
+    return {
+        "code": LLM_QUERY_CODE,
+        "workflow": {
+            "startNodeId": node_id,
+            "endNodeId": node_id,
+            "nodes": [
+                {
+                    "id": node_id,
+                    "name": "Extract Agreement ID",
+                    "prompt": "Extract the Agreement ID from this document. Return only the ID value.",
+                }
+            ],
+            "edges": [],
+        },
+        "shape": {
+            "dataType": "String",
+            "cardinality": "scalar",
+            "includeAliases": False,
+        },
+    }
+
+
+def add_llm_extraction_query(client: ApiClient, doc_type_id: str, extractor_id: str) -> None:
+    client.request_json(
+        "POST",
+        f"/api/v5/document-types/{doc_type_id}/llm-extractors/{extractor_id}/extraction-query",
+        llm_extraction_query_payload(),
+    )
+
+
+def fetch_llm_extractor_id(client: ApiClient, doc_type_id: str) -> str | None:
+    _, payload = client.request_json(
+        "GET",
+        f"/api/v5/document-types/{doc_type_id}?extras=llm-extractors",
+    )
+    extractors = payload.get("llmExtractors") or []
+    if not extractors:
+        return None
+    return extractors[0].get("extractorId")
+
+
+def llm_extractor_needs_query(client: ApiClient, doc_type_id: str) -> bool:
+    _, payload = client.request_json(
+        "GET",
+        f"/api/v5/document-types/{doc_type_id}?extras=llm-extractors",
+    )
+    extractors = payload.get("llmExtractors") or []
+    if not extractors:
+        return True
+    queries = extractors[0].get("queries") or []
+    return not any(q.get("code") == LLM_QUERY_CODE for q in queries)
+
+
+def document_type_needs_fields(client: ApiClient, doc_type_id: str) -> bool:
+    _, payload = client.request_json(
+        "GET",
+        f"/api/v5/document-types/{doc_type_id}?extras=extraction-fields",
+    )
+    return not (payload.get("extractionFields") or [])
+
+
+def add_extraction_field(
+    client: ApiClient,
+    doc_type_id: str,
+    *,
+    name: str,
+    extractor_id: str | None = None,
+    field_code: str | None = None,
+) -> str:
+    body: dict[str, Any] = {
+        "name": name,
+        "type": "string",
+        "required": False,
+    }
+    if extractor_id is not None:
+        body["extractorId"] = extractor_id
+    if field_code is not None:
+        body["code"] = field_code
+    _, payload = client.request_json(
+        "POST",
+        f"/api/v5/document-types/{doc_type_id}/extraction-fields",
+        body,
+    )
+    return str(payload.get("code", ""))
+
+
+def add_template_extraction_fields(client: ApiClient, doc_type_id: str) -> None:
+    for field_name in TEMPLATE_FIELDS:
+        add_extraction_field(client, doc_type_id, name=field_name)
+
+
+def fetch_template_versions(client: ApiClient, doc_type_id: str) -> list[dict[str, Any]]:
+    _, payload = client.request_json(
+        "GET",
+        f"/api/v5/document-types/{doc_type_id}/template/versions",
+    )
+    return (payload or {}).get("versions") or []
+
+
+def template_has_version(client: ApiClient, doc_type_id: str) -> bool:
+    return bool(fetch_template_versions(client, doc_type_id))
+
+
+def create_template_version(client: ApiClient, doc_type_id: str, *, name: str, sample_file: str) -> None:
+    """Upload a reference page so the template has at least one version to extract against.
+
+    Template extraction always runs against a template's newest version — without one, any
+    document uploaded against the document type fails with "There are not versions for
+    template ... yet". Field markups are left for the user to draw in the UI (auto-markup
+    would otherwise try to create its own fields, conflicting with the ones added above).
+    """
+    content, mime = read_sample(sample_file)
+    client.request_multipart(
+        f"/api/v5/document-types/{doc_type_id}/template/versions",
+        fields={"name": name, "markupAutomatically": "false"},
+        files={"files": (sample_file, content, mime)},
+    )
+
+
+def wait_for_template_version(client: ApiClient, doc_type_id: str) -> str | None:
+    """Version creation runs through an async saga (preprocess → create → auto-markup); poll for it."""
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline:
+        versions = fetch_template_versions(client, doc_type_id)
+        if versions:
+            return versions[0].get("id")
+        time.sleep(WAIT_INTERVAL)
+    return None
+
+
+def ensure_template_version(client: ApiClient, doc_type_id: str, summary: SeedSummary) -> None:
+    if template_has_version(client, doc_type_id):
+        return
+    create_template_version(client, doc_type_id, name=TEMPLATE_VERSION_NAME, sample_file="invoice.png")
+    version_id = wait_for_template_version(client, doc_type_id)
+    if version_id:
+        print(f"  Created template version: {TEMPLATE_VERSION_NAME} ({version_id})")
+        summary.add("Template version", "created", version_id)
+    else:
+        print("  Warning: template version did not appear within the wait window")
+        summary.add("Template version", "failed", "timed out waiting for version creation")
+
+
+def add_prototype_extraction_fields(client: ApiClient, doc_type_id: str) -> None:
+    for field_name, mapping_key in PROTOTYPE_FIELDS:
+        field_code = add_extraction_field(client, doc_type_id, name=field_name)
+        client.request_json(
+            "POST",
+            f"/api/v5/document-types/{doc_type_id}/prototype/mappings",
+            {
+                "code": field_code,
+                "typeCode": "string",
+                "keys": [mapping_key],
+                "mappingType": "one_to_one",
+            },
+        )
+
+
+def add_llm_extraction_field(client: ApiClient, doc_type_id: str, extractor_id: str) -> None:
+    add_extraction_field(
+        client,
+        doc_type_id,
+        name=LLM_FIELD_NAME,
+        extractor_id=extractor_id,
+        field_code=LLM_QUERY_CODE,
+    )
+
+
+def has_uploaded_document(client: ApiClient, doc_type_id: str) -> bool:
+    _, payload = client.request_json(
+        "GET",
+        f"/api/v5/documents?types={doc_type_id}&perPage=1",
+    )
+    meta = payload.get("meta") or {}
+    return int(meta.get("total") or 0) > 0
+
+
+def create_template_type(client: ApiClient, summary: SeedSummary) -> str | None:
+    log_section("Template document type")
+    types = fetch_document_types(client)
+    existing = find_document_type_by_name(types, TEMPLATE_NAME)
+    if existing:
+        doc_type_id = existing["id"]
+        print(f"  Already exists: {TEMPLATE_NAME} ({doc_type_id})")
+        try:
+            if document_type_needs_fields(client, doc_type_id):
+                add_template_extraction_fields(client, doc_type_id)
+                print(f"  Added missing extraction fields: {', '.join(TEMPLATE_FIELDS)}")
+                summary.add("Template extraction fields", "created", ", ".join(TEMPLATE_FIELDS))
+        except ApiError as exc:
+            print(f"  Warning: could not backfill template fields: {exc}")
+            summary.add("Template extraction fields", "failed", str(exc))
+        try:
+            ensure_template_version(client, doc_type_id, summary)
+        except ApiError as exc:
+            print(f"  Warning: could not backfill template version: {exc}")
+            summary.add("Template version", "failed", str(exc))
+        summary.add("Template document type", "skipped", doc_type_id)
+        return doc_type_id
+
+    try:
+        group_id = ensure_template_group(client)
+        _, payload = client.request_json(
+            "POST",
+            "/api/v5/document-types/template",
+            {
+                "name": TEMPLATE_NAME,
+                "language": DEFAULT_LANGUAGE,
+                "engine": DEFAULT_ENGINE,
+                "description": "Demo invoice document type for template-based extraction",
+                "groupId": group_id,
+            },
+        )
+        doc_type_id = payload["templateId"]
+        print(f"  Created: {TEMPLATE_NAME} ({doc_type_id})")
+        summary.add("Template document type", "created", doc_type_id)
+    except ApiError as exc:
+        print(f"  Failed: {exc}")
+        summary.add("Template document type", "failed", str(exc))
+        return None
+
+    try:
+        add_template_extraction_fields(client, doc_type_id)
+        print(f"  Added extraction fields: {', '.join(TEMPLATE_FIELDS)}")
+    except ApiError as exc:
+        print(f"  Warning: could not add template fields: {exc}")
+        summary.add("Template extraction fields", "failed", str(exc))
+
+    try:
+        ensure_template_version(client, doc_type_id, summary)
+    except ApiError as exc:
+        print(f"  Warning: could not create template version: {exc}")
+        summary.add("Template version", "failed", str(exc))
+    return doc_type_id
+
+
+def create_prototype_type(client: ApiClient, summary: SeedSummary, engine: str) -> str | None:
+    log_section("Prototype document type")
+    types = fetch_document_types(client)
+    existing = find_document_type_by_name(types, PROTOTYPE_NAME)
+    if existing:
+        doc_type_id = existing["id"]
+        print(f"  Already exists: {PROTOTYPE_NAME} ({doc_type_id})")
+        try:
+            if document_type_needs_fields(client, doc_type_id):
+                add_prototype_extraction_fields(client, doc_type_id)
+                field_names = ", ".join(name for name, _ in PROTOTYPE_FIELDS)
+                print(f"  Added missing extraction fields: {field_names}")
+                summary.add("Prototype extraction fields", "created", field_names)
+        except ApiError as exc:
+            print(f"  Warning: could not backfill prototype fields: {exc}")
+            summary.add("Prototype extraction fields", "failed", str(exc))
+        summary.add("Prototype document type", "skipped", doc_type_id)
+        return doc_type_id
+
+    try:
+        _, payload = client.request_json(
+            "POST",
+            "/api/v5/document-types/prototype",
+            {
+                "name": PROTOTYPE_NAME,
+                "engine": engine,
+                "language": DEFAULT_LANGUAGE,
+                "description": "Demo ID card document type for prototype-based extraction",
+            },
+        )
+        doc_type_id = payload["id"]
+        print(f"  Created: {PROTOTYPE_NAME} ({doc_type_id})")
+
+        content, mime = read_sample("id-card.png")
+        client.request_multipart(
+            f"/api/v5/document-types/{doc_type_id}/prototype/layouts",
+            fields={},
+            files={"file": ("id-card.png", content, mime)},
+        )
+        print("  Uploaded reference layout: id-card.png")
+        summary.add("Prototype document type", "created", doc_type_id)
+    except ApiError as exc:
+        print(f"  Failed: {exc}")
+        summary.add("Prototype document type", "failed", str(exc))
+        return None
+
+    try:
+        add_prototype_extraction_fields(client, doc_type_id)
+        field_names = ", ".join(name for name, _ in PROTOTYPE_FIELDS)
+        print(f"  Added extraction fields: {field_names}")
+    except ApiError as exc:
+        print(f"  Warning: could not add prototype fields: {exc}")
+        summary.add("Prototype extraction fields", "failed", str(exc))
+    return doc_type_id
+
+
+def pick_llm_provider_model(client: ApiClient, cfg: dict[str, Any]) -> tuple[str, str] | None:
+    configured = configured_provider_codes(cfg)
+    if not configured:
+        return None
+
+    try:
+        _, payload = client.request_json("GET", "/api/v5/tools/llms")
+    except ApiError:
+        try:
+            _, payload = client.request_json("GET", "/api/v5/litellm/models")
+        except ApiError:
+            return None
+        data = payload.get("data") or []
+        if not data:
+            return None
+        model_id = data[0].get("id", "")
+        if "/" in model_id:
+            provider_prefix, model_code = model_id.split("/", 1)
+            provider_map = {
+                "dial": "dial",
+                "bedrock": "aws-bedrock",
+                "gemini": "google",
+                "azure": "azure",
+                "openai": "openai",
+            }
+            provider = provider_map.get(provider_prefix, provider_prefix)
+            if provider in configured:
+                return provider, model_code
+        return None
+
+    for provider_entry in payload.get("providers") or []:
+        code = provider_entry.get("code", "")
+        if code not in configured:
+            continue
+        models = provider_entry.get("models") or []
+        if models:
+            return code, models[0]["code"]
+    return None
+
+
+def create_llm_extractor_type(client: ApiClient, cfg: dict[str, Any], summary: SeedSummary) -> str | None:
+    log_section("LLM Extractor document type")
+    if not llm_credentials_configured(cfg):
+        print("  Skipped: no LLM provider credentials in deps.yaml")
+        print("  Configure: make setup-credentials → make apply-config → re-run make seed-demo-data")
+        summary.add("LLM Extractor document type", "skipped", "no LLM credentials")
+        return None
+
+    types = fetch_document_types(client)
+    existing = find_document_type_by_name(types, LLM_NAME)
+    if existing:
+        doc_type_id = existing["id"]
+        print(f"  Already exists: {LLM_NAME} ({doc_type_id})")
+        try:
+            extractor_id = fetch_llm_extractor_id(client, doc_type_id)
+            if extractor_id:
+                if document_type_needs_fields(client, doc_type_id):
+                    add_llm_extraction_field(client, doc_type_id, extractor_id)
+                    print(f"  Added missing extraction field: {LLM_FIELD_NAME}")
+                    summary.add("LLM extraction field", "created", LLM_FIELD_NAME)
+                if llm_extractor_needs_query(client, doc_type_id):
+                    add_llm_extraction_query(client, doc_type_id, extractor_id)
+                    print(f"  Added missing extraction query: {LLM_QUERY_CODE}")
+                    summary.add("LLM extraction query", "created", LLM_QUERY_CODE)
+        except ApiError as exc:
+            print(f"  Warning: could not backfill LLM field/query: {exc}")
+            summary.add("LLM extraction field", "failed", str(exc))
+        summary.add("LLM Extractor document type", "skipped", doc_type_id)
+        return doc_type_id
+
+    provider_model = pick_llm_provider_model(client, cfg)
+    if not provider_model:
+        print("  Skipped: no available LLM models from /api/v5/tools/llms")
+        print("  Ensure deps-litellm and deps-ai-fusion are running with valid credentials.")
+        summary.add("LLM Extractor document type", "skipped", "no models available")
+        return None
+
+    provider, model = provider_model
+    print(f"  Using LLM: {provider} / {model}")
+
+    try:
+        _, payload = client.request_json(
+            "POST",
+            "/api/v5/document-types/llm-extractor",
+            {
+                "extractorName": LLM_EXTRACTOR_NAME,
+                "documentTypeName": LLM_NAME,
+                "provider": provider,
+                "model": model,
+                "extractionParams": {
+                    "customInstruction": (
+                        "Extract key information from the service agreement document."
+                    ),
+                    "groupingFactor": 3,
+                    "temperature": 0.4,
+                },
+            },
+        )
+        doc_type_id = payload["documentTypeId"]
+        extractor_id = payload["extractorId"]
+        print(f"  Created: {LLM_NAME} ({doc_type_id}), extractor {extractor_id}")
+        summary.add("LLM Extractor document type", "created", doc_type_id)
+    except ApiError as exc:
+        print(f"  Failed: {exc}")
+        summary.add("LLM Extractor document type", "failed", str(exc))
+        return None
+
+    try:
+        add_llm_extraction_field(client, doc_type_id, extractor_id)
+        print(f"  Added extraction field: {LLM_FIELD_NAME}")
+        add_llm_extraction_query(client, doc_type_id, extractor_id)
+        print(f"  Added extraction query: {LLM_QUERY_CODE}")
+    except ApiError as exc:
+        print(f"  Warning: could not add LLM field/query: {exc}")
+        summary.add("LLM extraction field", "failed", str(exc))
+    return doc_type_id
+
+
+def upload_for_type(
+    client: ApiClient,
+    summary: SeedSummary,
+    *,
+    label: str,
+    doc_type_id: str | None,
+    document_name: str,
+    sample_file: str,
+    engine: str = DEFAULT_ENGINE,
+) -> None:
+    if not doc_type_id:
+        return
+    log_section(f"Upload document — {label}")
+    try:
+        if has_uploaded_document(client, doc_type_id):
+            print(f"  Already has a document for {label}")
+            summary.add(f"Document upload ({label})", "skipped", "already has a document")
+            return
+        document_id = upload_document(
+            client,
+            document_type_id=doc_type_id,
+            document_name=document_name,
+            sample_file=sample_file,
+            engine=engine,
+        )
+        print(f"  Uploaded {sample_file} → document {document_id}")
+        summary.add(f"Document upload ({label})", "created", f"document {document_id}")
+    except ApiError as exc:
+        print(f"  Failed: {exc}")
+        summary.add(f"Document upload ({label})", "failed", str(exc))
+
+
+LLM_UNAVAILABLE_DETAILS = ("no LLM credentials", "no models available")
+
+
+def print_summary(summary: SeedSummary) -> None:
+    log_section("Summary")
+    for item in summary.results:
+        marker = {"created": "✓", "skipped": "○", "failed": "✗"}.get(item.status, "?")
+        detail = f" — {item.detail}" if item.detail else ""
+        print(f"  {marker} {item.label}: {item.status}{detail}")
+
+    notes: list[str] = []
+    version_result = next((r for r in summary.results if r.label == "Template version"), None)
+    if version_result and version_result.status == "created":
+        notes.append(
+            "The Demo Invoice Template has a reference version but no field markups yet — open it in "
+            "the UI (Document Types → Demo Invoice Template → Versions) and draw markups for "
+            "'Invoice Number' and 'Total Due' so extraction can locate their values."
+        )
+    llm_result = next((r for r in summary.results if r.label == "LLM Extractor document type"), None)
+    if llm_result and llm_result.status == "skipped" and llm_result.detail in LLM_UNAVAILABLE_DETAILS:
+        notes.append(
+            "Could not create the AI (LLM Extractor) demo document type — no usable AI provider "
+            "is configured or reachable. Run `make setup-credentials`, then `make apply-config`, "
+            "then re-run `make seed-demo-data` to enable AI-based extraction."
+        )
+    if summary.ocr_fallback_used:
+        notes.append(
+            "Prototype and LLM Extractor document types used the open-source Tesseract OCR "
+            "engine — extraction quality will be noticeably lower than a paid engine. Configure "
+            "ocr.azure_form_recognizer / ocr.aws_textract / ocr.gcp_vision in deps.yaml, run "
+            "`make apply-config`, and re-run `make seed-demo-data` for future document types."
+        )
+    if notes:
+        log_section("Notes")
+        for note in notes:
+            print(f"  ⚠ {note}")
+
+    print(f"\nOpen the UI: {summary.base_url}")
+    print("Explore Document Types and uploaded documents to try Template, Prototype, and LLM extraction.")
+
+
+def ensure_samples_exist() -> None:
+    required = ("invoice.png", "id-card.png", "service-agreement.png")
+    missing = [name for name in required if not (SAMPLES_DIR / name).exists()]
+    if missing:
+        print(f"Sample files missing ({', '.join(missing)}). Generating …")
+        generate_script = REPO / "demo-data" / "generate_samples.py"
+        if generate_script.exists():
+            import subprocess
+
+            subprocess.run([sys.executable, str(generate_script)], check=True)
+        else:
+            raise SystemExit(f"Missing samples in {SAMPLES_DIR} and no generator found.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Seed DEPS demo document types and documents.")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="API gateway base URL (default: frontend.base_url from deps.yaml or http://localhost:8000)",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config()
+    base_url = resolve_base_url(cfg, args.base_url)
+    client = ApiClient(base_url)
+    summary = SeedSummary(base_url=base_url)
+
+    print(f"Seeding demo data via {base_url} …")
+    ensure_samples_exist()
+
+    log_section("Readiness")
+    client.wait_until_ready()
+    print("  API is reachable.")
+
+    log_section("OCR engine")
+    print(f"  Template OCR engine: Tesseract ({DEFAULT_ENGINE})")
+    paid_ocr_engine = pick_ocr_engine(cfg, summary)
+
+    template_id = create_template_type(client, summary)
+    prototype_id = create_prototype_type(client, summary, engine=paid_ocr_engine)
+    llm_id = create_llm_extractor_type(client, cfg, summary)
+
+    upload_for_type(
+        client,
+        summary,
+        label="Template",
+        doc_type_id=template_id,
+        document_name="Demo Invoice Upload",
+        sample_file="invoice.png",
+        engine=DEFAULT_ENGINE,
+    )
+    upload_for_type(
+        client,
+        summary,
+        label="Prototype",
+        doc_type_id=prototype_id,
+        document_name="Demo ID Card Upload",
+        sample_file="id-card.png",
+        engine=paid_ocr_engine,
+    )
+    upload_for_type(
+        client,
+        summary,
+        label="LLM Extractor",
+        doc_type_id=llm_id,
+        document_name="Demo Service Agreement Upload",
+        sample_file="service-agreement.png",
+        engine=paid_ocr_engine,
+    )
+
+    print_summary(summary)
+
+    failed = [r for r in summary.results if r.status == "failed"]
+    if failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
