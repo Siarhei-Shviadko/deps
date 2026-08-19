@@ -1,0 +1,99 @@
+[submodule "core-services/deps-infra"]
+	path = core-services/deps-infra
+	url = git@github.com:Siarhei-Shviadko/deps-infra.git
+[submodule "feature-services/deps-ai-fusion"]
+	path = feature-services/deps-ai-fusion
+	url = git@github.com:Siarhei-Shviadko/deps-ai-fusion.git
+[submodule "extraction-plugins/deps-all-fields-qa"]
+	path = extraction-plugins/deps-all-fields-qa
+	url = git@github.com:Siarhei-Shviadko/deps-all-fields-qa.git
+[submodule "extraction-plugins/deps-all-fields-qa-validation"]
+	path = extraction-plugins/deps-all-fields-qa-validation
+	url = git@github.com:Siarhei-Shviadko/deps-all-fields-qa-validation.git
+[submodule "core-services/deps-api-gateway"]
+	path = core-services/deps-api-gateway
+	url = git@github.com:Siarhei-Shviadko/deps-api-gateway.git
+[submodule "core-services/deps-backend"]
+	path = core-services/deps-backend
+	url = git@github.com:Siarhei-Shviadko/deps-backend.git
+[submodule "core-services/deps-document-type"]
+	path = core-services/deps-document-type
+	url = git@github.com:Siarhei-Shviadko/deps-document-type.git
+[submodule "core-services/deps-event-relay"]
+	path = core-services/deps-event-relay
+	url = git@github.com:Siarhei-Shviadko/deps-event-relay.git
+[submodule "core-services/deps-extraction"]
+	path = core-services/deps-extraction
+	url = git@github.com:Siarhei-Shviadko/deps-extraction.git
+[submodule "core-services/deps-file-storage"]
+	path = core-services/deps-file-storage
+	url = git@github.com:Siarhei-Shviadko/deps-file-storage.git
+[submodule "core-services/deps-frontend"]
+	path = core-services/deps-frontend
+	url = git@github.com:Siarhei-Shviadko/deps-frontend.git
+[submodule "core-services/deps-generic-unifier-plugin"]
+	path = core-services/deps-generic-unifier-plugin
+	url = git@github.com:Siarhei-Shviadko/deps-generic-unifier-plugin.git
+[submodule "core-services/deps-high-sparrow"]
+	path = core-services/deps-high-sparrow
+	url = git@github.com:Siarhei-Shviadko/deps-high-sparrow.git
+[submodule "core-services/deps-iam"]
+	path = core-services/deps-iam
+	url = git@github.com:Siarhei-Shviadko/deps-iam.git
+[submodule "core-services/deps-nginx"]
+	path = core-services/deps-nginx
+	url = git@github.com:Siarhei-Shviadko/deps-nginx.git
+[submodule "core-services/deps-ocr-gateway"]
+	path = core-services/deps-ocr-gateway
+	url = git@github.com:Siarhei-Shviadko/deps-ocr-gateway.git
+[submodule "core-services/deps-parsing"]
+	path = core-services/deps-parsing
+	url = git@github.com:Siarhei-Shviadko/deps-parsing.git
+[submodule "core-services/deps-unifier"]
+	path = core-services/deps-unifier
+	url = git@github.com:Siarhei-Shviadko/deps-unifier.git
+[submodule "core-services/deps-workflow-manager"]
+	path = core-services/deps-workflow-manager
+	url = git@github.com:Siarhei-Shviadko/deps-workflow-manager.git
+[submodule "core-services/deps-litellm"]
+	path = core-services/deps-litellm
+	url = git@github.com:Siarhei-Shviadko/deps-litellm.git
+[submodule "feature-services/deps-agentic-ai"]
+	path = feature-services/deps-agentic-ai
+	url = git@github.com:Siarhei-Shviadko/deps-agentic-ai.git
+[submodule "feature-services/deps-classification"]
+	path = feature-services/deps-classification
+	url = git@github.com:Siarhei-Shviadko/deps-classification.git
+[submodule "feature-services/deps-cloud-native-extraction"]
+	path = feature-services/deps-cloud-native-extraction
+	url = git@github.com:Siarhei-Shviadko/deps-cloud-native-extraction.git
+[submodule "feature-services/deps-enrichment"]
+	path = feature-services/deps-enrichment
+	url = git@github.com:Siarhei-Shviadko/deps-enrichment.git
+[submodule "feature-services/deps-file"]
+	path = feature-services/deps-file
+	url = git@github.com:Siarhei-Shviadko/deps-file.git
+[submodule "feature-services/deps-files-batch"]
+	path = feature-services/deps-files-batch
+	url = git@github.com:Siarhei-Shviadko/deps-files-batch.git
+[submodule "feature-services/deps-groups"]
+	path = feature-services/deps-groups
+	url = git@github.com:Siarhei-Shviadko/deps-groups.git
+[submodule "feature-services/deps-image-preprocess"]
+	path = feature-services/deps-image-preprocess
+	url = git@github.com:Siarhei-Shviadko/deps-image-preprocess.git
+[submodule "feature-services/deps-meta-agent"]
+	path = feature-services/deps-meta-agent
+	url = git@github.com:Siarhei-Shviadko/deps-meta-agent.git
+[submodule "feature-services/deps-output-exporting"]
+	path = feature-services/deps-output-exporting
+	url = git@github.com:Siarhei-Shviadko/deps-output-exporting.git
+[submodule "feature-services/deps-prototype"]
+	path = feature-services/deps-prototype
+	url = git@github.com:Siarhei-Shviadko/deps-prototype.git
+[submodule "feature-services/deps-tables"]
+	path = feature-services/deps-tables
+	url = git@github.com:Siarhei-Shviadko/deps-tables.git
+[submodule "feature-services/deps-template"]
+	path = feature-services/deps-template
+	url = git@github.com:Siarhei-Shviadko/deps-template.git

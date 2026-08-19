@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Fast-forward every nested submodule to its remote default branch.
+#
+# Not used by `make update`. That target checks out first-level services from
+# origin, then nested vendors at the SHAs those service commits recorded.
+# Run this script only if you intentionally want vendor clones on latest remote HEAD.
+#
+# Why this exists: `git submodule foreach --recursive 'git fetch && git remote set-head'`
+# opens two new SSH connections per checkout. This repo has ~100 nested clones of
+# only ~30 unique remotes, so GitHub starts throttling after the first burst and
+# the command appears to hang.
+#
+# Strategy:
+#   1. Reuse one SSH connection to github.com (ControlMaster).
+#   2. Fetch each unique origin URL once.
+#   3. Fast-forward duplicate vendor clones from the local copy (no network).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+eval "$(bin/git-protocol env)"
+
+export GIT_TERMINAL_PROMPT=0
+
+SOCK="${TMPDIR:-/tmp}/deps-update-ssh-$$"
+cleanup() {
+	ssh -o ControlPath="$SOCK" -O exit git@github.com >/dev/null 2>&1 || true
+	rm -f "$SOCK"
+}
+trap cleanup EXIT
+
+if [[ "$DEPS_GIT_PROTOCOL" == ssh ]]; then
+	echo "Opening shared SSH connection to GitHub..."
+	if ssh -o ControlMaster=yes -o ControlPath="$SOCK" -o ControlPersist=5m \
+		-o ConnectTimeout=15 -fN git@github.com; then
+		export GIT_SSH_COMMAND="ssh -o ControlPath=${SOCK} -o ConnectTimeout=15"
+		echo "SSH multiplexing enabled."
+	else
+		echo "Warning: could not open SSH master; each fetch will open a new connection."
+		export GIT_SSH_COMMAND="ssh -o ConnectTimeout=15"
+	fi
+else
+	echo "Using HTTPS for GitHub clones (no SSH multiplexing)."
+fi
+
+mapfile -t ENTRIES < <(
+	git submodule foreach --recursive --quiet \
+		'url=$(git remote get-url origin 2>/dev/null || true)
+		 [ -n "$url" ] && printf "%s\t%s\n" "$url" "$displaypath"'
+)
+
+declare -A CANONICAL
+total="${#ENTRIES[@]}"
+fetched=0
+copied=0
+skipped=0
+i=0
+
+echo "Fast-forwarding ${total} nested checkouts..."
+
+for entry in "${ENTRIES[@]}"; do
+	i=$((i + 1))
+	url="${entry%%	*}"
+	path="${entry#*	}"
+	printf '[%d/%d] %s ... ' "$i" "$total" "$path"
+
+	if [[ -z "$url" || ! -e "$path/.git" ]]; then
+		echo "skip (no origin)"
+		skipped=$((skipped + 1))
+		continue
+	fi
+
+	if [[ -n "${CANONICAL[$url]:-}" ]]; then
+		src="${CANONICAL[$url]}"
+		if git -C "$path" fetch --quiet "$ROOT/$src" HEAD \
+			&& git -C "$path" merge --ff-only FETCH_HEAD >/dev/null; then
+			echo "ok (from ${src})"
+			copied=$((copied + 1))
+		else
+			echo "skip (not fast-forwardable)"
+			skipped=$((skipped + 1))
+		fi
+		continue
+	fi
+
+	if git -C "$path" fetch --quiet origin HEAD \
+		&& git -C "$path" merge --ff-only FETCH_HEAD >/dev/null; then
+		CANONICAL[$url]="$path"
+		echo "ok (fetched)"
+		fetched=$((fetched + 1))
+	else
+		echo "skip (no accessible remote or not fast-forwardable)"
+		skipped=$((skipped + 1))
+	fi
+done
+
+echo
+echo "Done: ${fetched} remote fetches, ${copied} local copies, ${skipped} skipped."
