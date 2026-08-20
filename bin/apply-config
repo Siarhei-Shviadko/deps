@@ -37,19 +37,41 @@ def get(obj, *keys, default=None):
 def configured(value) -> bool:
     return value is not None and str(value).strip() != ""
 
-def set_env(rel_path: str, key: str, value) -> None:
+def _env_path(rel_path: str) -> Path | None:
+    path = REPO / rel_path
+    return path if path.exists() else None
+
+
+def ensure_env(rel_path: str, key: str) -> None:
+    """If KEY is missing from the env file, append KEY= so expected vars are visible."""
+    path = _env_path(rel_path)
+    if path is None:
+        return
+    content = path.read_text()
+    pattern = re.compile(rf'^{re.escape(key)}=.*', re.MULTILINE)
+    if pattern.search(content):
+        return
+    path.write_text(content.rstrip("\n") + f"\n{key}=\n")
+    print(f"    {rel_path}  →  {key}=")
+
+
+def set_env(rel_path: str, key: str, value, *, write_empty: bool = False) -> None:
     """
     Write KEY=value into a service env file.
     - If the key already exists: replaces the line in-place.
     - If the key is absent: appends it.
-    - Skips silently when value is None/empty or the file doesn't exist.
+    - Skips silently when value is None/empty or the file doesn't exist,
+      unless write_empty is True.
     """
     if value is None or str(value).strip() == "":
+        if not write_empty:
+            return
+        val_str = ""
+    else:
+        val_str = str(value).lower() if isinstance(value, bool) else str(value)
+    path = _env_path(rel_path)
+    if path is None:
         return
-    path = REPO / rel_path
-    if not path.exists():
-        return
-    val_str = str(value).lower() if isinstance(value, bool) else str(value)
     content = path.read_text()
     pattern = re.compile(rf'^{re.escape(key)}=.*', re.MULTILINE)
     if pattern.search(content):
@@ -67,6 +89,21 @@ def apply_flag_to_all_dev_envs(key: str, value) -> None:
     """
     if value is None:
         return
+    for rel, content in _iter_dev_env_files():
+        if re.search(rf"^{key}=", content, re.MULTILINE):
+            set_env(rel, key, value)
+
+
+def apply_key_to_auth_dev_envs(key: str, value) -> None:
+    """Write KEY=value into every .dev.env / dev.env that declares AUTH_ENABLED (append if missing)."""
+    if not configured(value):
+        return
+    for rel, content in _iter_dev_env_files():
+        if re.search(r"^AUTH_ENABLED=", content, re.MULTILINE):
+            set_env(rel, key, value)
+
+
+def _iter_dev_env_files():
     for path in sorted(REPO.rglob("*.env")):
         rel = str(path.relative_to(REPO))
         if any(skip in rel for skip in ("vendor", ".test.env", ".local.env")):
@@ -74,11 +111,22 @@ def apply_flag_to_all_dev_envs(key: str, value) -> None:
         if not (rel.endswith(".dev.env") or rel.endswith("dev.env")):
             continue
         try:
-            content = path.read_text()
+            yield rel, path.read_text()
         except OSError:
             continue
-        if re.search(rf"^{key}=", content, re.MULTILINE):
-            set_env(rel, key, value)
+
+
+def resolve_certs_endpoint(auth) -> str:
+    """JWKS URL for AUTH_CERTS_ENDPOINT. Prefer an explicit value, else derive from OIDC."""
+    explicit = get(auth, "certs_endpoint")
+    if configured(explicit):
+        return str(explicit).strip()
+    base = get(auth, "base_url")
+    realm = get(auth, "realm")
+    if configured(base) and configured(realm):
+        return f"{str(base).rstrip('/')}/auth/realms/{realm}/protocol/openid-connect/certs"
+    # Placeholder so AUTH_ENABLED=true services pass settings validation without a real IdP.
+    return "http://deps-iam-api:8000/mock-jwks"
 
 # ── service env file paths ────────────────────────────────────────────────────
 
@@ -107,7 +155,7 @@ STORAGE_FILES = [
 FRONTEND_DEFAULTS = {
     "WTF_CSRF_ENABLED":                               "true",
     "FALLBACK_LANG":                                  "en-US",
-    "AUTH_TYPE":                                      "oidc",
+    "AUTH_TYPE":                                      "no-auth",
     "REQUEST_TIMEOUT":                                "2400000",
     "MAX_FILE_SIZE_MB":                               "100",
     "MAX_PROTOTYPE_REFERENCE_LAYOUT_SIZE_MB":         "100",
@@ -410,12 +458,15 @@ def main() -> None:
     set_env(FRONTEND, "ONE_DRIVE_CLIENT_ID",             get(onedrive, "client_id"))
     set_env(FRONTEND, "ONE_DRIVE_SERVICE_ACCOUNT_EMAIL", get(onedrive, "service_account_email"))
 
-    # Step 4: OIDC auth settings (only active when feature_flags.auth_enabled: true)
+    # Step 4: OIDC settings. AUTH_TYPE itself is set later from feature_flags.auth_enabled.
+    # Always emit the keys so they are visible in .env even when deps.yaml leaves them empty.
     auth_fe = get(cfg, "auth") or {}
+    for key in ("AUTH_BASE_URL", "AUTH_REALM", "AUTH_CLIENT_ID", "AUTH_SCOPE"):
+        ensure_env(FRONTEND, key)
     set_env(FRONTEND, "AUTH_BASE_URL",  get(auth_fe, "base_url"))
     set_env(FRONTEND, "AUTH_REALM",     get(auth_fe, "realm"))
     set_env(FRONTEND, "AUTH_CLIENT_ID", get(auth_fe, "client_id"))
-    set_env(FRONTEND, "AUTH_SCOPE",     get(auth_fe, "scope"))
+    set_env(FRONTEND, "AUTH_SCOPE",     get(auth_fe, "scope"), write_empty=True)
 
     # Step 5: Elastic APM
     apm = get(cfg, "elastic_apm") or {}
@@ -424,18 +475,30 @@ def main() -> None:
     set_env(FRONTEND, "ELASTIC_SERVICE_NAME", get(apm, "service_name"))
     set_env(FRONTEND, "ELASTIC_PROJECT_CODE", get(apm, "project_code"))
 
-    # ── Auth (nginx) ──────────────────────────────────────────────────────────
+    # ── Auth (nginx + service JWKS) ───────────────────────────────────────────
     log_section("Auth")
     auth = get(cfg, "auth") or {}
     set_env(NGINX, "UPSTREAM_AUTH_URL", get(auth, "upstream_auth_url"))
     set_env(NGINX, "AUTH_URI",          get(auth, "auth_uri"))
+    certs_endpoint = resolve_certs_endpoint(auth)
+    apply_key_to_auth_dev_envs("AUTH_CERTS_ENDPOINT", certs_endpoint)
 
     # ── Feature flags ─────────────────────────────────────────────────────────
     log_section("Feature flags")
     flags = get(cfg, "feature_flags") or {}
 
-    # auth_enabled → deps-iam only
-    set_env(IAM, "AUTH_ENABLED", get(flags, "auth_enabled"))
+    # Frontend AUTH_TYPE: explicit frontend.auth_type, else oidc when an IdP is configured.
+    auth_enabled = get(flags, "auth_enabled")
+    set_env(IAM, "AUTH_ENABLED", auth_enabled)
+    fe_auth_type = get(fe, "auth_type")
+    oidc_configured = configured(get(cfg, "auth", "base_url")) and configured(get(cfg, "auth", "client_id"))
+    if configured(fe_auth_type):
+        auth_type = str(fe_auth_type).strip()
+    elif oidc_configured or auth_enabled:
+        auth_type = "oidc"
+    else:
+        auth_type = "no-auth"
+    set_env(FRONTEND, "AUTH_TYPE", auth_type)
 
     # deps-image-preprocess requires auth on for local / open-source
     set_env(IMAGE_PREPROCESS, "AUTH_ENABLED", True)
