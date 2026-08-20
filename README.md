@@ -78,7 +78,7 @@ All credentials live in `deps.yaml` (gitignored). `deps.yaml.example` documents 
 | LLM | none | EPAM DIAL, Azure OpenAI, OpenAI, AWS Bedrock, Google Gemini, Deepseek, Groq — at least one is required for LLM Extractor document types |
 | Storage | local MinIO | Azure Blob, AWS S3, GCP |
 | Cloud Native Extraction | disabled | Azure Key Vault service principal (`parsing.cloud_native_extraction`: `azure_vault_url`, `client_id`, `tenant_id`, `client_secret`) — required so `deps-cloud-native-extraction` can store the per-document-type Azure Document Intelligence API keys you supply via the API |
-| Other | frontend OIDC (`AUTH_TYPE=oidc`); IAM auth off | SMTP (invite emails), Elastic APM, Google Drive / OneDrive pickers |
+| Other | frontend OIDC (`AUTH_TYPE=oidc`, EPAM Keycloak `deps-client-dev`); IAM auth off | SMTP (invite emails), Elastic APM, Google Drive / OneDrive pickers |
 
 Tesseract is enough to start Template extraction. Configure a paid OCR engine for Prototype and LLM document types, and at least one LLM provider for AI extraction. AWS Textract additionally needs a real AWS S3 bucket (`ocr.aws_textract.s3_bucket_name` / `s3_endpoint_url`) so `deps-parsing` can upload documents for Textract to read — local MinIO is not enough. Cloud Native Extraction additionally needs the Key Vault credentials above before you can attach any Azure Document Intelligence model to a document type.
 

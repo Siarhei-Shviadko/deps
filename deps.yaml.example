@@ -141,11 +141,16 @@ auth:
   upstream_auth_url: ""         # e.g. http://deps-iam-api:8080
   auth_uri: ""                  # e.g. /api/iam/auth/token/verify
 
-  # OIDC — browser-side auth (deps-frontend)
-  base_url: ""                  # e.g. https://keycloak.example.com/auth
-  realm: ""                     # e.g. deps
-  client_id: ""                 # OIDC client ID registered in your provider
-  scope: "openid email profile"
+  # OIDC — browser-side auth, written to deps-frontend/.env as:
+  #   AUTH_BASE_URL, AUTH_REALM, AUTH_CLIENT_ID, AUTH_SCOPE
+  # These defaults are applied on a fresh clone via `make env` → `make apply-config`.
+  base_url: "https://keycloak.cloud-infra.deps.epam.com"
+  realm: "dev"
+  client_id: "deps-client-dev"
+  scope: ""
+  # JWKS URL written as AUTH_CERTS_ENDPOINT to every service with AUTH_ENABLED.
+  # If empty, derived as {base_url}/auth/realms/{realm}/protocol/openid-connect/certs
+  certs_endpoint: ""
 
 # ── Elastic APM ───────────────────────────────────────────────────────────────
 # Browser-side APM for deps-frontend. Leave all empty to disable.
@@ -158,10 +163,11 @@ elastic_apm:
 # ── Frontend ─────────────────────────────────────────────────────────────────
 # base_url is the public URL of the DEPS nginx gateway (port 8000 by default).
 # All service endpoint URLs sent to the browser are derived from it automatically.
-# FEATURE_* flag defaults and AUTH_TYPE are baked into bin/apply-config;
-# set individual keys here to override them.
+# FEATURE_* flag defaults are baked into bin/apply-config.
+# AUTH_TYPE comes from frontend.auth_type when set, otherwise from auth.* / feature_flags.auth_enabled.
 frontend:
   base_url: "http://localhost:8000"
+  auth_type: oidc
 
   # Cloud file-picker integrations (optional)
   google_drive:
@@ -178,7 +184,7 @@ frontend:
 # open-source / first-time use (auth off, telemetry off).
 feature_flags:
   # Auth — set to true once you have an OIDC provider configured.
-  # Applies to deps-iam only.
+  # Applies to deps-iam (AUTH_ENABLED) and deps-frontend (AUTH_TYPE=oidc vs no-auth).
   auth_enabled: false
 
   # SSL verification for auth token endpoint calls (disable for self-signed certs).

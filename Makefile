@@ -61,6 +61,7 @@ env:
 	touch feature-services/deps-files-batch/.env
 	touch feature-services/deps-classification/.env
 	touch feature-services/deps-tables/.env
+	touch feature-services/deps-image-preprocess/.env
 	touch extraction-plugins/deps-all-fields-qa/.env
 	touch extraction-plugins/deps-all-fields-qa-validation/.env
 	touch core-services/deps-litellm/.env
@@ -148,7 +149,6 @@ migrate:
 	cd feature-services/deps-template && make migrate
 	cd feature-services/deps-files-batch && make migrate
 	cd feature-services/deps-classification && make migrate
-	cd feature-services/deps-tables && make migrate
 
 .PHONY: setup-credentials
 setup-credentials:
