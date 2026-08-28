@@ -3,6 +3,8 @@
 
 export PATH := $(CURDIR)/bin:$(PATH)
 
+PYTHON := $(shell python3 --version > /dev/null 2>&1 && echo python3 || echo python)
+
 .PHONY: prereq
 prereq:
 	docker network create deps-network || true
@@ -156,11 +158,11 @@ setup-credentials:
 
 .PHONY: seed-demo-data
 seed-demo-data:
-	python3 bin/seed-demo-data
+	$(PYTHON) bin/seed-demo-data
 
 .PHONY: apply-config
 apply-config:
-	python3 bin/apply-config
+	$(PYTHON) bin/apply-config
 
 .PHONY: start
 start: | prereq fetch env apply-config build run-infra run migrate
