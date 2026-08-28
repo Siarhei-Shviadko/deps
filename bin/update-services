@@ -36,10 +36,6 @@ else
 fi
 
 echo
-echo "Cleaning untracked .gitattributes in first-level submodules..."
-git submodule foreach 'git clean -f .gitattributes 2>/dev/null || true'
-
-echo
 echo "Updating first-level services from origin..."
 git -c submodule.fetchJobs=2 submodule update --init --remote
 
