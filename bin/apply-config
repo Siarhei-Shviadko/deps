@@ -155,7 +155,6 @@ STORAGE_FILES = [
 FRONTEND_DEFAULTS = {
     "WTF_CSRF_ENABLED":                               "true",
     "FALLBACK_LANG":                                  "en-US",
-    "AUTH_TYPE":                                      "no-auth",
     "REQUEST_TIMEOUT":                                "2400000",
     "MAX_FILE_SIZE_MB":                               "100",
     "MAX_PROTOTYPE_REFERENCE_LAYOUT_SIZE_MB":         "100",
@@ -207,7 +206,7 @@ FRONTEND_DEFAULTS = {
     "FEATURE_RETRY_PREVIOUS_STEP":                    "true",
     "FEATURE_TABLE_DETECTION":                        "true",
     "FEATURE_COLLAPSIBLE_SELECTED_CELLS":             "false",
-    "FEATURE_MANAGE_TEMPLATE_VERSIONS":               "true",
+    "FEATURE_MANAGE_TEMPLATE_VERSIONS":               "false",
     "FEATURE_SHOW_NOT_APPLICABLE_CONFIDENCE":         "false",
     "FEATURE_DATA_EXTRACTION":                        "true",
     "FEATURE_DOCUMENT_CHANGE_TYPE":                   "true",
@@ -487,17 +486,11 @@ def main() -> None:
     log_section("Feature flags")
     flags = get(cfg, "feature_flags") or {}
 
-    # Frontend AUTH_TYPE: explicit frontend.auth_type, else oidc when an IdP is configured.
     auth_enabled = get(flags, "auth_enabled")
     set_env(IAM, "AUTH_ENABLED", auth_enabled)
+    # AUTH_TYPE: use explicit frontend.auth_type from deps.yaml; default is no-auth.
     fe_auth_type = get(fe, "auth_type")
-    oidc_configured = configured(get(cfg, "auth", "base_url")) and configured(get(cfg, "auth", "client_id"))
-    if configured(fe_auth_type):
-        auth_type = str(fe_auth_type).strip()
-    elif oidc_configured or auth_enabled:
-        auth_type = "oidc"
-    else:
-        auth_type = "no-auth"
+    auth_type = str(fe_auth_type).strip() if configured(fe_auth_type) else "no-auth"
     set_env(FRONTEND, "AUTH_TYPE", auth_type)
 
     # deps-image-preprocess requires auth on for local / open-source
